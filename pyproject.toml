@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "nextpoint-auto-judge"
+version = "0.1.0"
+description = "NextPoint deposition annotation using TREC AutoJudge"
+requires-python = ">=3.10"
+
+dependencies = [
+    "autojudge-base>=0.3.2",
+    "autojudge-annotate>=0.3.3",
+]
