@@ -66,15 +66,16 @@ class _QAExtractor:
         self.answer_line_number = 0
         self.answer_page_number = 0
         self.waiting_for_page_number = False
+        self.orphan_lines: List[str] = []  # non-Q/A lines encountered after intro
 
-    def extract_qa_pairs(self, lines: List[str]) -> Tuple[List[Tuple], List[str]]:
+    def extract_qa_pairs(self, lines: List[str]) -> Tuple[List[Tuple], List[str], List[str]]:
         self._reset_state()
-        for i, line in enumerate(lines, 1):
+        for line in lines:
             if self._handle_page_number(line):
                 continue
             self._process_line(line)
         self._flush_current_pair()
-        return self.qa_pairs, self.introductory_lines
+        return self.qa_pairs, self.introductory_lines, self.orphan_lines
 
     def _handle_page_number(self, line: str) -> bool:
         page_related = False
@@ -117,6 +118,10 @@ class _QAExtractor:
             content = re.sub(r"^\s*\d+\s+", "", line.strip())
             if content:
                 (self.current_question if self.mode == "Q" else self.current_answer).append(content)
+        else:
+            stripped = line.strip()
+            if stripped:
+                self.orphan_lines.append(stripped)
 
     def _is_q(self, line: str) -> bool:
         return bool(re.match(r"^\s*\d+[:.\s]+\s*Q\b", line.strip()))
@@ -159,50 +164,43 @@ class _QAExtractor:
 # Chunking
 # ---------------------------------------------------------------------------
 
-def chunk_qa_pairs_with_overlap(
-    qa_pairs: List[Tuple],
+def chunk_full_text(
+    full_text: str,
+    answer_ends: List[int],
     chunk_size_chars: int = 4000,
-    overlap: int = 2,
-) -> List[List[Tuple]]:
-    """Group Q&A pairs into overlapping chunks by approximate character count.
+    overlap_chars: int = 200,
+) -> List[Tuple[int, int]]:
+    """Split full_text into overlapping (start, end) char ranges.
+
+    Chunk boundaries are snapped to positions in answer_ends so that no chunk
+    ends in the middle of an answer.  Overlap is character-based.
 
     Args:
-        qa_pairs:         List of (question, answer, q_page, q_line, a_page, a_line).
+        full_text:        The complete deposition text.
+        answer_ends:      Sorted list of char positions where answers end
+                          (valid cut points).  Must include len(full_text).
         chunk_size_chars: Soft upper limit on characters per chunk.
-        overlap:          Number of pairs shared between consecutive chunks.
+        overlap_chars:    Characters of overlap between consecutive chunks.
 
     Returns:
-        List of chunks; each chunk is a list of Q&A tuples.
+        List of (start, end) character ranges into full_text.
     """
-    chunks: List[List[Tuple]] = []
-    current_chunk: List[Tuple] = []
-    current_size = 0
-    i = 0
+    if not answer_ends:
+        return [(0, len(full_text))]
 
-    while i < len(qa_pairs):
-        pair = qa_pairs[i]
-        q, a = pair[0], pair[1]
-        pair_size = len(q) + len(a) + 6  # "Q: …\nA: …\n\n"
+    ranges: List[Tuple[int, int]] = []
+    start = 0
 
-        if current_size + pair_size > chunk_size_chars and current_chunk:
-            chunks.append(current_chunk)
-            overlap_start = max(0, len(current_chunk) - overlap)
-            current_chunk = current_chunk[overlap_start:]
-            current_size = sum(len(p[0]) + len(p[1]) + 6 for p in current_chunk)
+    for end in answer_ends:
+        if end - start >= chunk_size_chars:
+            ranges.append((start, end))
+            start = max(0, end - overlap_chars)
 
-        current_chunk.append(pair)
-        current_size += pair_size
-        i += 1
+    # Final chunk covering any remaining text
+    if start < len(full_text):
+        ranges.append((start, len(full_text)))
 
-    if current_chunk:
-        chunks.append(current_chunk)
-
-    return chunks
-
-
-def chunk_to_text(chunk: List[Tuple]) -> str:
-    """Render a list of Q&A tuples as a readable text block."""
-    return "\n\n".join(f"Q: {pair[0]}\nA: {pair[1]}" for pair in chunk)
+    return ranges
 
 
 # ---------------------------------------------------------------------------
@@ -213,60 +211,104 @@ def deposition_to_documents(
     filepath: str,
     depo_id: str,
     chunk_size_chars: int = 4000,
-    overlap: int = 2,
+    overlap_chars: int = 200,
 ) -> List[Document]:
-    """Load a deposition, extract Q&A pairs, and return one Document per chunk.
+    """Load a deposition and return one Document per chunk plus a fulltext Document.
+
+    The full text (intro + Q&A + trailing content) is stored as a single
+    '{depo_id}_fulltext' document.  Chunks are character-based overlapping
+    slices of that full text, always ending at the boundary of a complete answer.
 
     Args:
         filepath:         Path to the deposition .txt file.
         depo_id:          Short identifier used as the doc_id prefix.
         chunk_size_chars: Soft upper limit on characters per chunk.
-        overlap:          Number of Q&A pairs shared between consecutive chunks.
+        overlap_chars:    Characters of overlap between consecutive chunks.
 
     Returns:
-        List of Document objects (empty if no Q&A pairs were found).
+        List of Document objects.
     """
     print(f"  Reading: {filepath}")
     lines = read_transcript_file(filepath)
 
     extractor = _QAExtractor()
-    qa_pairs, _ = extractor.extract_qa_pairs(lines)
+    qa_pairs, intro_lines, orphan_lines = extractor.extract_qa_pairs(lines)
     print(f"  Extracted {len(qa_pairs)} Q&A pairs")
 
-    if not qa_pairs:
-        print(f"  WARNING: No Q&A pairs found in {filepath}")
+    sep = "\n\n"
+
+    # --- Build full text and answer-end positions ---
+    full_parts: List[str] = []
+    intro_text = "\n".join(l for l in intro_lines if l.strip())
+    if intro_text.strip():
+        full_parts.append(intro_text)
+
+    # Track where each answer ends in the eventual full_text
+    base_offset = sum(len(p) + len(sep) for p in full_parts)
+    answer_ends: List[int] = []
+    qa_texts: List[str] = []
+    for pair in qa_pairs:
+        qa_text = f"Q: {pair[0]}\nA: {pair[1]}"
+        qa_texts.append(qa_text)
+        answer_ends.append(base_offset + len(qa_text))
+        base_offset += len(qa_text) + len(sep)
+
+    if qa_texts:
+        full_parts.append(sep.join(qa_texts))
+
+    orphan_text = "\n".join(orphan_lines)
+    if orphan_text.strip():
+        full_parts.append(orphan_text)
+
+    full_text = sep.join(full_parts)
+    if not full_text.strip():
+        print(f"  WARNING: no content found in {filepath}")
         return []
 
-    chunks = chunk_qa_pairs_with_overlap(
-        qa_pairs, chunk_size_chars=chunk_size_chars, overlap=overlap
+    # Always include end-of-document as a valid cut point
+    answer_ends.append(len(full_text))
+    print(f"  Full text: {len(full_text)} chars")
+
+    # --- Chunk ---
+    ranges = chunk_full_text(
+        full_text, answer_ends,
+        chunk_size_chars=chunk_size_chars,
+        overlap_chars=overlap_chars,
     )
-    print(f"  Chunked into {len(chunks)} passages "
-          f"(~{chunk_size_chars} chars each, overlap={overlap} pairs)")
+    print(f"  Chunked into {len(ranges)} passages "
+          f"(~{chunk_size_chars} chars each, overlap={overlap_chars} chars)")
 
-    documents: List[Document] = []
-    for i, chunk in enumerate(chunks):
-        doc_id = f"{depo_id}_chunk_{i:04d}"
-        text = chunk_to_text(chunk)
-
-        # page range: q_page of first pair … a_page of last pair
-        start_page = chunk[0][2]
-        end_page = chunk[-1][4]
-
-        doc = Document(
-            id=doc_id,
-            text=text,
-            title=f"{depo_id} (chunk {i + 1}/{len(chunks)})",
+    # --- Documents ---
+    fulltext_doc_id = f"{depo_id}_fulltext"
+    documents: List[Document] = [
+        Document(
+            id=fulltext_doc_id,
+            text=full_text,
+            title=f"{depo_id} (complete deposition)",
             metadata={
                 "deposition_id": depo_id,
-                "chunk_index": i,
-                "total_chunks": len(chunks),
-                "start_page": start_page,
-                "end_page": end_page,
+                "chunk_type": "fulltext",
                 "source_file": str(filepath),
-                "num_qa_pairs": len(chunk),
             },
         )
-        documents.append(doc)
+    ]
+
+    for i, (ft_start, ft_end) in enumerate(ranges):
+        documents.append(Document(
+            id=f"{depo_id}_chunk_{i:04d}",
+            text=full_text[ft_start:ft_end],
+            title=f"{depo_id} (chunk {i + 1}/{len(ranges)})",
+            metadata={
+                "deposition_id": depo_id,
+                "chunk_type": "qa",
+                "chunk_index": i,
+                "total_chunks": len(ranges),
+                "source_file": str(filepath),
+                "fulltext_doc_id": fulltext_doc_id,
+                "full_text_start": ft_start,
+                "full_text_end": ft_end,
+            },
+        ))
 
     return documents
 
@@ -287,14 +329,18 @@ def create_fake_report(
     is_ragtime=False so no RAGTIME-specific validation is triggered.
     """
     doc_dict: Dict[str, Document] = {doc.id: doc for doc in documents}
-    all_doc_ids: List[str] = list(doc_dict.keys())
+    # Cite only the chunks, not the fulltext document (it's a lookup target, not a result)
+    cited_ids: List[str] = [
+        doc.id for doc in documents
+        if (doc.metadata or {}).get("chunk_type") != "fulltext"
+    ]
 
     fake_sentence = NeuclirReportSentence(
         text=(
             "This report contains the full deposition transcript "
-            "split into overlapping Q&A chunks."
+            "split into overlapping chunks."
         ),
-        citations=all_doc_ids,
+        citations=cited_ids,
     )
 
     metadata = ReportMetaData(
@@ -344,8 +390,8 @@ def main() -> None:
         help="Approximate max character count per chunk (default: 4000).",
     )
     parser.add_argument(
-        "--overlap", type=int, default=2,
-        help="Number of Q&A pairs shared between consecutive chunks (default: 2).",
+        "--overlap", type=int, default=200,
+        help="Characters of overlap between consecutive chunks (default: 200).",
     )
     args = parser.parse_args()
 
@@ -366,7 +412,7 @@ def main() -> None:
             filepath=str(input_path),
             depo_id=depo_id,
             chunk_size_chars=args.chunk_size,
-            overlap=args.overlap,
+            overlap_chars=args.overlap,
         )
 
         if not documents:
@@ -375,7 +421,7 @@ def main() -> None:
 
         report = create_fake_report(
             documents=documents,
-            query_id=args.query_id,
+            query_id=depo_id,
             run_id=args.run_id,
             team_id=args.team_id,
         )
