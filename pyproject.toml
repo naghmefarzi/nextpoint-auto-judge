@@ -12,3 +12,4 @@ dependencies = [
     "autojudge-base>=0.3.2",
     "autojudge-annotate>=0.3.5",
 ]
+

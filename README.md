@@ -21,7 +21,7 @@ uv pip install -e .
 Generate the annotation HTML file:
 
 ```bash
-autojudge-annotate \
+autojudge-annotate generate \
     --rag-responses results \
     --rag-topics topics/nextpoint-deposition/nextpoint-deposition.jsonl \
     --output nextpoint-annotator.html \
