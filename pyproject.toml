@@ -10,5 +10,6 @@ requires-python = ">=3.10"
 
 dependencies = [
     "autojudge-base>=0.3.2",
-    "autojudge-annotate>=0.3.5",
+    "autojudge-annotate>=0.3.6",
 ]
+
