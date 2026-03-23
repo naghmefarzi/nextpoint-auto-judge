@@ -231,43 +231,47 @@ def deposition_to_documents(
     print(f"  Reading: {filepath}")
     lines = read_transcript_file(filepath)
 
-    extractor = _QAExtractor()
-    qa_pairs, intro_lines, orphan_lines = extractor.extract_qa_pairs(lines)
-    print(f"  Extracted {len(qa_pairs)} Q&A pairs")
+    # --- Build clean full text directly from raw lines ---
+    clean_lines: List[str] = []
+    q_line_indices: List[int] = []
 
-    sep = "\n\n"
+    for raw in lines:
+        raw = raw.replace("\f", "")
+        stripped = raw.strip()
+        if not stripped:
+            clean_lines.append("")
+            continue
+        if re.match(r"^\s*\d+[:.\s]+\s*Q\b", stripped):
+            q_line_indices.append(len(clean_lines))
+        # clean_lines.append(re.sub(r"^\s*\d+\s+", "", stripped))
+        clean_lines.append(stripped)
 
-    # --- Build full text and answer-end positions ---
-    full_parts: List[str] = []
-    intro_text = "\n".join(l for l in intro_lines if l.strip())
-    if intro_text.strip():
-        full_parts.append(intro_text)
-
-    # Track where each answer ends in the eventual full_text
-    base_offset = sum(len(p) + len(sep) for p in full_parts)
-    answer_ends: List[int] = []
-    qa_texts: List[str] = []
-    for pair in qa_pairs:
-        qa_text = f"Q: {pair[0]}\nA: {pair[1]}"
-        qa_texts.append(qa_text)
-        answer_ends.append(base_offset + len(qa_text))
-        base_offset += len(qa_text) + len(sep)
-
-    if qa_texts:
-        full_parts.append(sep.join(qa_texts))
-
-    orphan_text = "\n".join(orphan_lines)
-    if orphan_text.strip():
-        full_parts.append(orphan_text)
-
-    full_text = sep.join(full_parts)
+    full_text = "\n".join(clean_lines)
     if not full_text.strip():
         print(f"  WARNING: no content found in {filepath}")
         return []
 
-    # Always include end-of-document as a valid cut point
-    answer_ends.append(len(full_text))
     print(f"  Full text: {len(full_text)} chars")
+
+    # --- Cut points: end of last answer line just before each new Q line ---
+    line_starts: List[int] = []
+    pos = 0
+    for line in clean_lines:
+        line_starts.append(pos)
+        pos += len(line) + 1
+
+    answer_ends: List[int] = []
+    for qi in q_line_indices:
+        if qi == 0:
+            continue
+        j = qi - 1
+        while j >= 0 and not clean_lines[j].strip():
+            j -= 1
+        if j >= 0:
+            cut = line_starts[j] + len(clean_lines[j])
+            if not answer_ends or cut != answer_ends[-1]:
+                answer_ends.append(cut)
+    answer_ends.append(len(full_text))
 
     # --- Chunk ---
     ranges = chunk_full_text(
@@ -293,22 +297,22 @@ def deposition_to_documents(
         )
     ]
 
-    for i, (ft_start, ft_end) in enumerate(ranges):
-        documents.append(Document(
-            id=f"{depo_id}_chunk_{i:04d}",
-            text=full_text[ft_start:ft_end],
-            title=f"{depo_id} (chunk {i + 1}/{len(ranges)})",
-            metadata={
-                "deposition_id": depo_id,
-                "chunk_type": "qa",
-                "chunk_index": i,
-                "total_chunks": len(ranges),
-                "source_file": str(filepath),
-                "fulltext_doc_id": fulltext_doc_id,
-                "full_text_start": ft_start,
-                "full_text_end": ft_end,
-            },
-        ))
+    # for i, (ft_start, ft_end) in enumerate(ranges):
+    #     documents.append(Document(
+    #         id=f"{depo_id}_chunk_{i:04d}",
+    #         text=full_text[ft_start:ft_end],
+    #         title=f"{depo_id} (chunk {i + 1}/{len(ranges)})",
+    #         metadata={
+    #             "deposition_id": depo_id,
+    #             "chunk_type": "qa",
+    #             "chunk_index": i,
+    #             "total_chunks": len(ranges),
+    #             "source_file": str(filepath),
+    #             "fulltext_doc_id": fulltext_doc_id,
+    #             "full_text_start": ft_start,
+    #             "full_text_end": ft_end,
+    #         },
+    #     ))
 
     return documents
 
@@ -332,7 +336,7 @@ def create_fake_report(
     # Cite only the chunks, not the fulltext document (it's a lookup target, not a result)
     cited_ids: List[str] = [
         doc.id for doc in documents
-        if (doc.metadata or {}).get("chunk_type") != "fulltext"
+        if (doc.metadata or {}).get("chunk_type") == "fulltext"
     ]
 
     fake_sentence = NeuclirReportSentence(
